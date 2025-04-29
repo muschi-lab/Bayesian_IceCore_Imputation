@@ -1,0 +1,363 @@
+---
+title: "MCMC gap-filling for ice core CFA records"
+author: "Francesco Muschitiello"
+date: "25/04/2022"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align="center")
+# Set working directory, i.e. the folder where the output files are stored
+# knitr::opts_knit$set(root.dir = "my_workdir")
+```
+
+```{r load packages, include=FALSE}
+# Load the library (install package first)
+if (!"plyr" %in% installed.packages()) install.packages("plyr")
+if (!"accelerometry" %in% installed.packages()) install.packages("accelerometry")
+if (!"zoo" %in% installed.packages()) install.packages("zoo")
+if (!"Hmisc" %in% installed.packages()) install.packages("Hmisc")
+if (!"BayesianTools" %in% installed.packages()) install.packages("BayesianTools")
+if (!"rstan" %in% installed.packages()) install.packages("rstan")
+if (!"forecast" %in% installed.packages()) install.packages("forecast")
+require(plyr)
+require(accelerometry)
+require(zoo)
+require(Hmisc)
+require(BayesianTools)
+require(rstan)
+require(forecast)
+```
+
+## Load Skytrain IR CH4 data
+
+```{r Load CFA data}
+# Based on data published in: King, A.C.F., Bauska, T.K., Brook, E.J. et al. Reconciling ice core CO2 and land-use change following New World-Old World contact. Nat Commun 15, 1735 (2024). https://doi.org/10.1038/s41467-024-45894-9
+#
+# load data tables and drop depth column
+CH4_c <- read.table(file="data/ST_CH4_cont.txt", header=TRUE)[,-1]
+CH4_d <- read.table(file="data/ST_CH4_discr.txt", header=TRUE)[,-1]
+# remove possible NAs
+CH4_c <- na.omit(CH4_c)
+CH4_d <- na.omit(CH4_d)
+```
+
+## Plot data with a smoothing spline 
+
+```{r plot data with spline}
+myspline <- smooth.spline(CH4_c, spar = 0.75) # spar: smoothing parameter
+# plot data
+par(mar=c(5.1,4.1,4.1,5.1))
+plot(CH4_c, type='l', ylab="CH4 (ppb)", xlab="Years AD", col="dodgerblue",
+     xlim=c(1400,1650), ylim=c(655, 760))
+lines(CH4_d, type='o', pch=15, col="darkblue")
+lines(myspline, col="dodgerblue3", lwd=3)
+legend("topleft", c("CFA", "smoothing spline", "discrete measurements"), lty=c(1,1,1), 
+       col=c("dodgerblue", "dodgerblue3", "darkblue"), pch=c(NA,NA,15), lwd=c(1,3,1), cex=0.75)
+```
+
+## Output sampling interval information for continuous and discrete CH4 data, and plot data gaps
+
+```{r summary stats and data gap plotting}
+# calculate mean sampling resolution of CFA data
+res <- mean(abs(diff(CH4_c[,1])))  
+# user-defined threshold length for detecting gaps
+myres <- 2 # years
+# calculate time differential 
+dt <- abs(diff(CH4_c[,1]))
+# index for values of 'dt' larger than 'myres' (i.e. gaps)
+gap <- which(dt > myres) 
+# identify start and end time of data gaps
+gaps_up <- CH4_c[-1,1][gap]
+gaps_low <- CH4_c[-1,1][gap-1]
+
+# plot data and gaps
+plot(CH4_c, type='l', ylab="CH4 (ppb)", xlab="Years AD", col="dodgerblue",
+     xlim=c(1400,1650), ylim=c(655, 760))
+rect(gaps_up, 600, gaps_low, 800, col = "grey90", border = NA) # highlight gaps
+```
+
+## Data interpolation (this is required for estimating moving averages using user-defined time windows)
+
+```{r data interpolation}
+# set a time vector specifying where interpolation is to take place
+mytime <- seq(head(CH4_c[,1])[1], tail(CH4_c[,1])[6], by=-res)
+# linearly interpolate CH4 data 
+CH4_c_int <- as.data.frame(approx(CH4_c[,1], CH4_c[,2], mytime))
+# fill in NAs where data gaps occur
+for(i in 1:length(gaps_up)){
+  CH4_c_int[CH4_c_int[,1] >= gaps_up[i] & CH4_c_int[,1] <= gaps_low[i], 2] <- NA
+}
+
+# compare raw and interpolated data
+plot(CH4_c, type='l', ylab="CH4 (ppb)", xlab="Years AD", col="dodgerblue",
+     xlim=c(1400,1650), ylim=c(655, 760))
+lines(CH4_c_int, col="grey")
+legend("topleft", c("raw", "interpolated"), lty=c(1,1), col=c("dodgerblue", "grey"), cex=0.75)
+```
+
+## Moving average
+
+```{r moving average with NAs}
+rollwindow <- 20 # width (in years)
+mywidth <- round(rollwindow/res,0) # window width (in numbers of observations) 
+myrolltime <- mytime # time vector
+myrollmean <- rollapply(CH4_c_int[,2],FUN=mean, width=mywidth, na.rm = TRUE) # running mean (with NAs)
+myrollsd <- rollapply(CH4_c_int[,2],FUN=sd, width=mywidth, na.rm = TRUE) # running sd (with NAs)
+tid <- myrolltime[(mywidth:length(CH4_c_int[,1]))-mywidth/2] # adjusted time vector for plotting
+
+# plot results
+plot(CH4_c, type='n', ylab="CH4 (ppb)", xlab="Years AD", xlim=c(1400,1650), ylim=c(655, 760))
+rect(gaps_up, 600, gaps_low, 800, col = "grey90", border = NA) # highlight gaps
+lines(CH4_c, col="dodgerblue")
+lines(CH4_d, type='o', pch=15, col="darkblue")
+lines(tid, myrollmean, col="orange")
+lines(tid, myrollmean + 2*myrollsd, lty=3, col="orange")
+lines(tid, myrollmean - 2*myrollsd, lty=3, col="orange")
+legend("topleft", c("CFA","moving average (20-year windows)","2-sigma error", "discrete"), pch=c(NA,NA,NA,15), lty=c(1,1,3,1), col=c("dodgerblue", "orange","orange", "darkblue"), cex=0.75)
+```
+
+## Simulate CFA CH4 data to fill gaps using Markov Chain Monte Carlo (MCMC)
+**This is a Bayesian model that simulates data for the CFA gaps. The simulated data retain: 1. the same autoregressive (AR) coefficients as the observed CFA measurements, 2. the same moving average as the observed CFA measurements, 3. the same values as the discrete CFA measurements**
+
+```{r prepare input data for MCMC model}
+thin <- 5 # thinning factor to reduce the resolution of the CFA data (i.e. the number of model parameters) and reduce computation time
+mystep <- round(res,3)*thin # interpolation time steps based on mean res CFA data
+# Note that 'res' has been pre-defined in the block 'summary stats' above.
+int <- seq(1426,1618, by=mystep) # time vector from tmin to tmax
+# extrapolate moving mean and error to obtain edge values
+myint_mean <- as.data.frame(approxExtrap(tid, myrollmean, int))
+myint_err <- as.data.frame(approxExtrap(tid, myrollsd, int))
+
+# subset discrete data: only retain entries that overlap with CFA record
+CH4_d_sub <- CH4_d[CH4_d[,1] > tail(CH4_c[,1])[6] & CH4_d[,1] < head(CH4_c[,1])[1],]
+# sort in increasing order
+ref <- CH4_d_sub[order(CH4_d_sub[,1]),]
+
+# linearly interpolate the CFA data and fill in gaps
+mydata_int <- as.data.frame(approx(CH4_c[,1], CH4_c[,2], int))
+mygaps <- c(gaps_up, gaps_low)
+mygaps <- sort(mygaps)
+# fill in NAs where data gaps occur
+for(i in seq(1,length(mygaps),by=2)){
+  mydata_int[mydata_int[,1] >= mygaps[i] & mydata_int[,1] <= mygaps[i+1], 2] <- NA
+}
+
+# calculate the first 150 autocorrelation coefficients of the interpolated data 
+# (this is approximately ~22 years, i.e. 'mystep*150'); ideally the autocorrelation lag should be longer than the longest gap in the CFA data
+acf_span <- 150 # number of coeffs
+myacf <- acf(mydata_int[,2], na.action = na.pass, lag.max = acf_span, plot = FALSE)$acf[1:acf_span]
+```
+
+
+## Setup parameters for the joint probability distribution of the Bayesian model (i.e.the likelihood function)
+
+```{r setups for likelihood function}
+Dt <- 1 # +/- time span of each discrete CH4 measurement
+err <- 10/2 # analytic error of discrete CH4 measurements (for OSU data error is +/-3.1 ppm at 2 sigma)
+rollwindow <- 20 # window width (in years)
+mywidth <- round(rollwindow/mystep,0) # window width (in numbers of observations) 
+myrolltime <- int # time vector
+mystep <- mystep # time vector for plotting (as per 'binning section')
+mycomplete <- which(complete.cases(mydata_int[,2])) # index complete observations in 'mydata_int'
+myint_mean_comp <- myint_mean[mycomplete,2] # subset of moving average
+```
+
+## Likelihood function
+
+```{r likelihood function}
+likelihood <- function(param){
+  mymodel <- param[seq(from=1, length.out = length(int))]
+  # calculate mean simulated CH4 values at times t = CH4_d_sub[,1]
+  disc <- sapply(1:length(ref[,1]), function(i){
+    disc <- mean(mymodel[int > (ref[i,1]-Dt) & int < (ref[i,1]+Dt)])
+  })
+  # estimate mismatch between simulated and observed discrete data (binning)
+  likelihood1 <- sum(dnorm(disc, ref[,2], sd = err, log=TRUE)) 
+  
+  ### calculate rolling mean simulated CH4 values over intervals without missing data
+  # moving average (use 'movingaves' from package 'accelerometry' -faster)
+  myrollmean <- movingaves(mymodel,window=mywidth) # running mean
+  tid <- int[(mywidth:length(int))-mywidth/2] # adjusted time vector for plotting
+  # extrapolate over the whole time interval 'int'
+  myrollmean_int <- as.data.frame(approxExtrap(tid, myrollmean, int))
+  # subset rolling mean over sections without missing data
+  myresult <- myrollmean_int[mycomplete,2]
+  # estimate mismatch between simulated and observed CFA data (moving average)
+  likelihood2 <- sum(dnorm(myresult, myint_mean_comp, sd = err, log=TRUE)) # for OSU data error is +/-3.1 ppm (2 sigma)
+  
+  ### calculate acf coefficients of the simulated data
+  myacf_sim <- acf(mymodel, lag.max = acf_span, plot = FALSE)$acf[1:acf_span]
+  # estimate mismatch between simulated and observed data (AR coefficients)
+  likelihood3 <- sum(dnorm(myacf_sim, myacf, sd = 0.05, log=TRUE))
+  
+  #### summation of the misfits
+  sumll <- sum(likelihood1, likelihood2, likelihood3)
+  return(sumll)
+}
+```
+
+## Prescribe priors, initial values of the MCMC sampler, and set up the model
+
+```{r initialize the MCMC model}
+ll <- likelihood
+# prescribe priors - currently using 3x stdevs from the running means (larger/smaller priors can be assigned)
+low <- c(myint_mean[,2] - (3*myint_err[,2])) 
+up <- c(myint_mean[,2] + (3*myint_err[,2]))
+# setup the Bayesian model
+bayesianSetup <- createBayesianSetup(likelihood = ll, 
+                                     lower = low, upper = up,
+                                     catchDuplicates = FALSE)
+# number of Markov chains
+settings = list(iterations = 100000) 
+```
+
+## Start MCMC
+
+```{r start MCMC}
+# run the MCMC model using a Differential Evolution (DE) Sampler
+chain <- runMCMC(bayesianSetup = bayesianSetup, sampler = "DEzs",settings = settings)
+# untag the following line if you want to continue a previous MCMC run
+# chain <- runMCMC(bayesianSetup = chain, sampler = "DEzs",settings = settings)
+```
+
+## Summary stats, burn-in, and extract output
+
+```{r MCMC summary and extract output}
+# extract posterior samples
+c <- getSample(chain, start = 0)
+# check convergence (should be below 1.1 for all parameters to demonstrate convergence)
+gD <- Rhat(c)
+# additional burn-in (remove 90% of simulations)
+burnIn = round((dim(c)[1]/100)*90,0)
+c <- c[-(1:burnIn),] # remove burn in steps
+# extract output
+sim <- sapply(1:dim(c)[1], function(i){
+  sim <- c[i,1:ncol(c)]
+})
+# estimate posterior median and quantiles
+quant <- t(apply(sim, 1, quantile, seq(0.05, 0.95, by= 0.025), na.rm=TRUE))
+```
+
+## Plot MCMC results
+
+```{r plot MCMC results}
+  par(mfrow=c(1,1))
+  plot(int, quant[,"50%"], type='n', 
+       xlim=c(1400,1650), ylim=c(655, 760), ylab="CH4 (ppb)", xlab="years AD")
+  rect(gaps_up, 600, gaps_low, 800, col = "grey90", border = NA) # highlight gaps
+  abline(v=seq(1300,1800,10), lty=3, lwd=0.25)
+  polygon(c(int, rev(int)), c(quant[,"95%"], rev(quant[,"5%"])), 
+          border=NA, col=adjustcolor("red", alpha=0.25))
+  lines(int, quant[,"50%"], lwd=0.5, col=2)
+  lines(mydata_int, col="dodgerblue", lwd=1)
+  # lines(CH4_c, col="dodgerblue", lwd=0.5)
+  lines(CH4_d, type='o', pch=15, col="darkblue")
+  legend("topleft", c("CFA (thinned)","discrete","simulated - median", "simulated - 95% credibility","data gaps"), lty=c(1,1,1,NA,NA), pch=c(NA,15,NA,15,15), col=c("dodgerblue", "darkblue", 2,"pink","grey"), cex=0.75)
+```
+
+# Compare smoothing spline/moving average of reconstructed versus simulated data
+
+```{r compare smoothing results}
+# compare smoothing spline from reconstructed and simulated data 
+simspline <- smooth.spline(cbind(int,quant[,"50%"]), spar = 0.75) # spar: smoothing paramater
+# plot results
+plot(CH4_c, type='l', ylab="CH4 (ppb)", xlab="Years AD", col="dodgerblue",
+     xlim=c(1400,1650), ylim=c(655, 760))
+lines(CH4_d, type='o', pch=15, col="darkblue")
+lines(simspline, col=2, lwd=2)
+lines(myspline, col="orange", lwd=2)
+legend("topleft", c("CFA","discrete", "smoothing spline (simulated)","smoothing spline (reconstruction)"), lty=c(1,1,1,1), pch=c(NA,15,NA,NA), lwd=c(1,1,2,2), col=c("dodgerblue","darkblue","red","orange"), cex=0.75)
+# 
+
+# compare moving average from reconstructed and simulated data 
+simrollmean <- rollapply(quant[,"50%"], FUN=mean, width=mywidth) 
+simtid <- int[(mywidth:length(quant[,"50%"]))-mywidth/2] # adjusted time vector for plotting
+# plot results
+plot(CH4_c, type='l', ylab="CH4 (ppb)", xlab="Years AD", col="dodgerblue",
+     xlim=c(1400,1650), ylim=c(655, 760))
+lines(CH4_d, type='o', pch=15, col="darkblue")
+lines(simtid, simrollmean, col=2, lwd=2)
+lines(tid, myrollmean, col="orange", lwd=2)
+legend("topleft", c("CFA","discrete", "moving average (simulated)","moving average (reconstruction)"), lty=c(1,1,1,1), pch=c(NA,15,NA,NA), lwd=c(1,1,2,2), col=c("dodgerblue","darkblue","red","orange"), cex=0.75)
+# 
+```
+
+## Missing data can can produce biased estimates, leading to invalid conclusions. Now that we have imputed the missing data we have a truly continuous record and can estimate any statistical metrics increasing the statistical power of our analyses. We can apply smoothing techniques (moving average, spline, bandpass filter, LOESS etc.), perform change point analysis, piecewise linear analysis to estimate trends, etc.
+
+
+## For plotting purposes only!
+**Now that we have modeled the low-frequency variability of the CFA data in a continuous way, we can fill in the gaps using high-frequency noise from one surrogate AR(1)-process with the same spectral characteristics as the original CFA data, i.e. one of the many possible realizations of the CFA data**
+
+**Since the longest interval with continuous CH4 measurements is only ~4 years, we'll
+simulate a AR-process using the entirety of the non-NA CFA data rather than a very short interval with available data entries.**
+
+```{r simulate ARIMA model from CFA data}
+# invert CFA data
+CFA <- CH4_c[order(CH4_c[,1]),]
+# user-defined threshold length for detecting gaps
+myres <- 0.03 # years (ca. 2x mean res)
+# calculate time differential 
+dt <- abs(diff(CFA[,1]))
+# index values of 'dt' larger than 'myres' 
+gap <- which(dt > myres) 
+# identify time gaps in the data
+gaps_up <- CFA[-1,1][gap]
+gaps_low <- CFA[-1,1][gap-1]
+# merge gaps
+Gaps <- c(gaps_up, gaps_low)
+Gaps <- sort(Gaps)
+
+# interpolate data at resolution MCMC model
+mytime <- seq(head(CFA[,1])[1], tail(CFA[,1])[6], by=res)
+# linearly interpolate CH4 data 
+CFA_int <- as.data.frame(approx(CFA[,1], CFA[,2], mytime))
+# fill in NAs where data gaps occur
+for(i in seq(1,length(Gaps),by=2)){
+  CFA_int[CFA_int[,1] >= Gaps[i] & CFA_int[,1] <= Gaps[i+1], 2] <- NA
+}
+
+# Let's generate an ARIMA model
+model <- auto.arima(CFA_int[,2], stationary = TRUE, parallel = TRUE, stepwise = FALSE)
+```
+
+## Use the ARIMA model to simulate a AR(1) realization of the CFA data and fill in gaps where appropriate
+
+```{r fill in gaps using a single AR(1) simulation}
+# now we need the high-passed median record from the MCMC model which we will use as baseline
+myfilter <- 1/20 # cutoff frequency (use the median sampling res of the discrete data)
+myHP <- bandpass(cbind(int, quant[,"50%"]), fhigh = myfilter, verbose = FALSE, genplot = FALSE)
+# interpolate filter at res ARIMA models
+myHP_int <- as.data.frame(approx(myHP[,1], myHP[,2], CFA_int[,1]))
+# index missing observations
+myincomp <- which(is.na(CFA_int[,2])) 
+# simulate CFA data from the ARIMA model
+sim <- simulate(model) # simulate an AR process from the distribution corresponding to the fitted model
+
+# remove variability longer than 'myfilter' i.e. 20 years
+sim_bp <- bandpass(cbind(CFA_int[,1], sim), flow = myfilter, verbose = FALSE, genplot = FALSE, addmean = FALSE)
+
+# final data set combing AR-simulated and measured CFA data
+myfinal <- cbind(c(CFA_int[-c(myincomp),1],myHP_int[myincomp,1]), 
+                   c(CFA_int[-c(myincomp),2],myHP_int[myincomp,2]+sim_bp[myincomp,2]))
+# sort in increasing order
+myfinal <- myfinal[order(myfinal[,1]),]
+
+### plot measured data with filled gaps based on AR(1)-process
+plot(myfinal, type='l', col="grey", ylab="CH4 (ppb)", xlab="years AD",
+     xlim=c(1400,1650), ylim=c(655, 760))
+abline(v=seq(1000,2000,10), lty=3, lwd=0.5)
+lines(CFA_int, col="dodgerblue")
+legend("topleft", c("CFA measured", "AR(1) simulated"), lty=c(1,1), col=c("dodgerblue", "grey"), cex=0.75)
+```
+
+## Save results on table
+
+```{r write-up results in wk directory}
+###################
+write.table(myfinal,file="data/ST_CH4_cont_AR1.txt", row.names=FALSE,
+            col.names=c("Gas_Age_yrsAD","CH4_ppb"))
+```
+
